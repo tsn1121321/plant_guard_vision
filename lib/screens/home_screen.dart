@@ -1,13 +1,12 @@
-import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:animations/animations.dart';
 import 'package:flutter/material.dart';
-import 'package:http/http.dart' as http;
-import 'package:http_parser/http_parser.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
+
+const String kServerAnalyzeUrl = 'http://10.0.2.2:5050/analyze';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -17,14 +16,14 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
-  static const String _serverUrl = 'http://10.0.2.2:5050/analyze';
-
   final ImagePicker _picker = ImagePicker();
+
   bool _picking = false;
   bool _sending = false;
+
   File? _imageFile;
-  String? _userName;
   Map<String, dynamic>? _result;
+  String? _userName;
 
   @override
   void initState() {
@@ -34,291 +33,341 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _loadName() async {
     final prefs = await SharedPreferences.getInstance();
-    setState(() {
-      _userName = prefs.getString('userName') ?? 'usuário';
-    });
-  }
-
-  Future<void> _pickFromGallery() async {
-    await _pickImage(ImageSource.gallery);
-  }
-
-  Future<void> _pickFromCamera() async {
-    await _pickImage(ImageSource.camera);
+    setState(() => _userName = prefs.getString('userName') ?? 'usuário');
   }
 
   Future<void> _pickImage(ImageSource source) async {
     if (_picking) return;
     setState(() => _picking = true);
-
     try {
       final XFile? pickedFile = await _picker.pickImage(
         source: source,
         imageQuality: 92,
-        maxWidth: 2400,
+        maxWidth: 2200,
+        maxHeight: 2200,
       );
-
       if (pickedFile != null) {
         setState(() {
           _imageFile = File(pickedFile.path);
           _result = null;
         });
-      } else {
-        debugPrint('Seleção cancelada pelo usuário.');
       }
     } catch (e) {
-      debugPrint('Erro ao selecionar imagem: $e');
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Não foi possível abrir a imagem.')),
-        );
-      }
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Erro ao selecionar imagem: $e')),
+      );
     } finally {
       if (mounted) setState(() => _picking = false);
     }
   }
 
-  //envio de imagem para o servidor
-  Future<void> _analyzeImage() async {
-    if (_imageFile == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Selecione uma imagem primeiro.')),
-      );
-      return;
-    }
-    if (_sending) return;
+  Future<void> _analyze() async {
+    final file = _imageFile;
+    if (file == null || _sending) return;
 
-    setState(() {
-      _sending = true;
-      _result = null;
-    });
-
+    setState(() => _sending = true);
     try {
-      final uri = Uri.parse(_serverUrl);
+      final uri = Uri.parse(kServerAnalyzeUrl);
       final req = http.MultipartRequest('POST', uri)
-        ..headers['Accept'] = 'application/json'
-        ..files.add(
-          await http.MultipartFile.fromPath(
-            'image',
-            _imageFile!.path,
-            contentType: MediaType('image', _guessImageSubtype(_imageFile!.path)),
-          ),
-        );
+        ..files.add(await http.MultipartFile.fromPath('image', file.path))
+        ..headers['Accept'] = 'application/json';
 
-      final streamed = await req.send().timeout(const Duration(seconds: 60));
-      final resp = await http.Response.fromStream(streamed);
-
-      if (resp.statusCode >= 200 && resp.statusCode < 300) {
-        final data = _safeJson(resp.body);
-        setState(() {
-          _result = data;
-        });
+      final streamed = await req.send();
+      final body = await streamed.stream.bytesToString();
+      if (streamed.statusCode >= 200 && streamed.statusCode < 300) {
+        final decoded = (jsonDecode(body) as Map<String, dynamic>);
+        Map<String, dynamic>? parsed;
+        if (decoded['result'] is Map<String, dynamic>) {
+          parsed = (decoded['result'] as Map<String, dynamic>);
+        } else if (decoded['raw'] is String) {
+          try {
+            parsed = jsonDecode(decoded['raw'] as String) as Map<String, dynamic>;
+          } catch (_) {
+            parsed = {'doenca': 'Resultado indisponível'};
+          }
+        }
+        setState(() => _result = parsed ?? {'doenca': 'Resultado indisponível'});
       } else {
-        debugPrint('HTTP ${resp.statusCode}: ${resp.body}');
-        _showError('Erro HTTP ${resp.statusCode}');
+        // mensagens comuns de erro
+        String msg = 'Erro ${streamed.statusCode}';
+        try {
+          final m = jsonDecode(body) as Map<String, dynamic>;
+          msg = m['error']?.toString() ?? msg;
+        } catch (_) {}
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(msg)),
+        );
       }
-    } on TimeoutException {
-      _showError('Tempo esgotado. Verifique sua conexão.');
     } catch (e) {
-      _showError('Falha ao enviar imagem: $e');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Falha ao analisar: $e')),
+      );
     } finally {
       if (mounted) setState(() => _sending = false);
     }
   }
 
-  //tipo de imagens suportadas
-  String _guessImageSubtype(String path) {
-    final p = path.toLowerCase();
-    if (p.endsWith('.png')) return 'png';
-    if (p.endsWith('.webp')) return 'webp';
-    if (p.endsWith('.heic') || p.endsWith('.heif')) return 'heic';
-    return 'jpeg';
-  }
+  //abre sheet com cuidados detalhados
+  void _openCareSheet(Map<String, dynamic> data) {
+    final disease = (data['doenca'] ??
+            data['disease'] ??
+            data['diagnosis'] ??
+            data['resultado'] ??
+            '')
+        .toString();
 
-  Map<String, dynamic> _safeJson(String body) {
-    try {
-      if (body.trim().isEmpty) return <String, dynamic>{};
-      final decoded = jsonDecode(body);
-      if (decoded is Map<String, dynamic>) return decoded;
-      return <String, dynamic>{'raw': decoded};
-    } catch (_) {
-      return <String, dynamic>{'raw': body};
-    }
-  }
+    final causes = (data['causaProvavel'] ??
+            data['causas'] ??
+            data['cause'] ??
+            data['causes'] ??
+            '')
+        .toString();
 
-  void _showError(String msg) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(msg), behavior: SnackBarBehavior.floating),
+    final treatment =
+        (data['tratamento'] ?? data['treatment'] ?? '').toString();
+
+    final tips = (data['dicas'] ?? data['tips'] ?? '').toString();
+
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Theme.of(context).colorScheme.surface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) {
+        return DraggableScrollableSheet(
+          expand: false,
+          initialChildSize: 0.65,
+          minChildSize: 0.4,
+          maxChildSize: 0.95,
+          builder: (context, scrollController) {
+            final healthy = _isHealthy(disease);
+            final icon = healthy ? Icons.eco_rounded : Icons.medical_services;
+            final iconColor = healthy ? Colors.green : Colors.redAccent;
+            final title = healthy
+                ? 'Como manter sua planta saudável'
+                : 'Cuidados recomendados';
+
+            return Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
+              child: ListView(
+                controller: scrollController,
+                children: [
+                  Center(
+                    child: Container(
+                      width: 46,
+                      height: 5,
+                      decoration: BoxDecoration(
+                        color: Theme.of(context)
+                            .colorScheme
+                            .onSurface
+                            .withOpacity(.2),
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      Icon(icon, color: iconColor, size: 28),
+                      const SizedBox(width: 8),
+                      Text(
+                        title,
+                        style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                              fontWeight: FontWeight.w800,
+                            ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  if (!healthy) ...[
+                    _bullet('Doença', disease),
+                    if (causes.isNotEmpty) _bullet('Causa provável', causes),
+                    if (treatment.isNotEmpty) _bullet('Tratamento', treatment),
+                  ] else ...[
+                    _bullet('Rotina', 'Mantenha regas regulares sem encharcar.'),
+                    _bullet('Luz', 'Prefira luz indireta brilhante para a maioria das espécies.'),
+                    _bullet('Folhas', 'Remova folhas secas e faça inspeções semanais.'),
+                    if (tips.isNotEmpty) _bullet('Dicas', tips),
+                  ],
+                  const SizedBox(height: 18),
+                  FilledButton.icon(
+                    onPressed: () => Navigator.pop(context),
+                    icon: const Icon(Icons.check_circle_outline),
+                    label: const Text('Entendi'),
+                  ),
+                ],
+              ),
+            );
+          },
+        );
+      },
     );
   }
 
-  //UI
+  bool _isHealthy(String s) {
+    final x = s.toLowerCase().trim();
+    return x == 'nenhuma' ||
+        x == 'saudável' ||
+        x.contains('sem doença') ||
+        x.contains('healthy') ||
+        x.contains('no disease');
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final title = 'Olá, ${_userName ?? "usuário"}! 🌱';
 
-    final gradient = LinearGradient(
-      begin: Alignment.topCenter,
-      end: Alignment.bottomCenter,
-      colors: [
-        theme.colorScheme.primary.withOpacity(0.12),
-        theme.colorScheme.tertiary.withOpacity(0.10),
-        theme.colorScheme.surface,
-      ],
+    final bg = Container(
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          colors: [
+            theme.colorScheme.primary.withOpacity(0.12),
+            theme.colorScheme.tertiary.withOpacity(0.10),
+            theme.colorScheme.surface,
+          ],
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+        ),
+      ),
     );
 
-    return Scaffold(
-      appBar: AppBar(
-        elevation: 0,
-        title: const Text('PlantGuard'),
-        centerTitle: true,
-      ),
-      body: Container(
-        decoration: BoxDecoration(gradient: gradient),
-        child: SafeArea(
-          child: Column(
-            children: [
-              const SizedBox(height: 12),
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 20),
-                child: Text(
-                  title,
-                  style: theme.textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w700),
-                  textAlign: TextAlign.center,
-                ),
-              ),
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 6),
-                child: Text(
-                  'Use a câmera ou escolha uma imagem da galeria\ne analise a saúde da sua planta.',
-                  style: theme.textTheme.bodyMedium?.copyWith(
-                    color: theme.colorScheme.onSurface.withOpacity(0.7),
+    return Stack(
+      children: [
+        bg,
+        Scaffold(
+          backgroundColor: Colors.transparent,
+          appBar: AppBar(
+            elevation: 0,
+            backgroundColor: theme.colorScheme.background.withOpacity(.6),
+            title: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Olá, ${_userName ?? 'usuário'}',
+                  style: theme.textTheme.titleMedium?.copyWith(
+                    fontWeight: FontWeight.w800,
                   ),
-                  textAlign: TextAlign.center,
                 ),
-              ),
-
-              const SizedBox(height: 12),
-
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 20),
-                child: OpenContainer(
-                  closedElevation: 0,
-                  closedShape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(18),
+                Text(
+                  'Vamos analisar a saúde da sua planta?',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.onBackground.withOpacity(.7),
                   ),
-                  closedColor: theme.colorScheme.surface.withOpacity(0.9),
-                  openColor: theme.colorScheme.surface,
-                  transitionType: ContainerTransitionType.fadeThrough,
-                  closedBuilder: (BuildContext context, VoidCallback open) {
-                    return AspectRatio(
-                      aspectRatio: 16 / 9,
-                      child: ClipRRect(
-                        borderRadius: BorderRadius.circular(18),
-                        child: _imageFile != null
-                            ? Image.file(_imageFile!, fit: BoxFit.cover)
-                            : Container(
-                                color: theme.colorScheme.surface,
-                                alignment: Alignment.center,
-                                child: Icon(
-                                  Icons.image_outlined,
-                                  size: 72,
-                                  color: theme.colorScheme.onSurface.withOpacity(0.35),
-                                ),
-                              ),
-                      ),
-                    );
-                  },
-                  openBuilder: (BuildContext context, VoidCallback _) {
-                    return Scaffold(
-                      appBar: AppBar(title: const Text('Pré-visualização')),
-                      body: Center(
-                        child: _imageFile != null
-                            ? InteractiveViewer(child: Image.file(_imageFile!))
-                            : const Text('Nenhuma imagem selecionada'),
-                      ),
-                    );
-                  },
                 ),
-              ),
-
-              const Spacer(),
-
-              //botões inferiores
-              Padding(
-                padding: const EdgeInsets.fromLTRB(20, 0, 20, 12),
-                child: Column(
-                  children: [
-                    _PrimaryButton(
-                      icon: Icons.photo_library_outlined,
-                      label: _picking ? 'Abrindo galeria...' : 'Galeria',
-                      onPressed: _picking ? null : _pickFromGallery,
+              ],
+            ),
+          ),
+          body: SafeArea(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  _imagePickerCard(theme),
+                  const SizedBox(height: 16),
+                  if (_imageFile != null)
+                    FilledButton.icon(
+                      onPressed: _sending ? null : _analyze,
+                      icon: _sending
+                          ? const SizedBox(
+                              width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                          : const Icon(Icons.search_rounded),
+                      label: Text(_sending ? 'Analisando...' : 'Analisar imagem'),
                     ),
-                    const SizedBox(height: 10),
-                    _PrimaryButton(
-                      icon: Icons.photo_camera_outlined,
-                      label: _picking ? 'Abrindo câmera...' : 'Câmera',
-                      onPressed: _picking ? null : _pickFromCamera,
-                    ),
-                    const SizedBox(height: 10),
-                    _PrimaryButton(
-                      icon: Icons.biotech_outlined,
-                      label: _sending ? 'Analisando...' : 'Analisar imagem',
-                      onPressed:
-                          (_imageFile == null || _sending || _picking) ? null : _analyzeImage,
+                  if (_result != null) ...[
+                    const SizedBox(height: 16),
+                    _ResultCard(
+                      data: _result!,
+                      onOpenCare: () => _openCareSheet(_result!),
                     ),
                   ],
+                ],
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _imagePickerCard(ThemeData theme) {
+    return Card(
+      elevation: 6,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+      color: theme.colorScheme.surface.withOpacity(.95),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          children: [
+            if (_imageFile != null) ...[
+              ClipRRect(
+                borderRadius: BorderRadius.circular(14),
+                child: AspectRatio(
+                  aspectRatio: 4 / 3,
+                  child: Image.file(
+                    _imageFile!,
+                    fit: BoxFit.cover,
+                  ),
                 ),
               ),
-
-              //resultado
-              AnimatedSwitcher(
-                duration: const Duration(milliseconds: 250),
-                child: _result == null
-                    ? const SizedBox.shrink()
-                    : Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
-                        child: _ResultCard(data: _result!),
-                      ),
+              const SizedBox(height: 12),
+            ] else ...[
+              Icon(Icons.local_florist_rounded,
+                  size: 56, color: theme.colorScheme.primary),
+              const SizedBox(height: 8),
+              Text(
+                'Selecione uma folha de perto, com boa luz.',
+                style: theme.textTheme.bodyMedium?.copyWith(
+                  color: theme.colorScheme.onSurface.withOpacity(.8),
+                ),
+                textAlign: TextAlign.center,
               ),
+              const SizedBox(height: 12),
             ],
-          ),
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: _picking ? null : () => _pickImage(ImageSource.gallery),
+                    icon: const Icon(Icons.photo_library_outlined),
+                    label: Text(_picking ? 'Abrindo...' : 'Galeria'),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: FilledButton.icon(
+                    onPressed: _picking ? null : () => _pickImage(ImageSource.camera),
+                    icon: const Icon(Icons.photo_camera_outlined),
+                    label: const Text('Câmera'),
+                  ),
+                ),
+              ],
+            ),
+          ],
         ),
       ),
     );
   }
-}
 
-class _PrimaryButton extends StatelessWidget {
-  final IconData icon;
-  final String label;
-  final VoidCallback? onPressed;
-
-  const _PrimaryButton({
-    required this.icon,
-    required this.label,
-    required this.onPressed,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return SizedBox(
-      width: double.infinity,
-      child: ElevatedButton.icon(
-        icon: Icon(icon),
-        label: Padding(
-          padding: const EdgeInsets.symmetric(vertical: 12.0),
-          child: Text(label),
+  Widget _bullet(String title, String content) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: RichText(
+        text: TextSpan(
+          style: Theme.of(context).textTheme.bodyMedium,
+          children: [
+            TextSpan(
+              text: '$title: ',
+              style: const TextStyle(fontWeight: FontWeight.w700),
+            ),
+            TextSpan(text: content),
+          ],
         ),
-        style: ElevatedButton.styleFrom(
-          backgroundColor: theme.colorScheme.primary,
-          foregroundColor: theme.colorScheme.onPrimary,
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        ),
-        onPressed: onPressed,
       ),
     );
   }
@@ -326,103 +375,155 @@ class _PrimaryButton extends StatelessWidget {
 
 class _ResultCard extends StatelessWidget {
   final Map<String, dynamic> data;
+  final VoidCallback onOpenCare;
 
-  const _ResultCard({required this.data});
+  const _ResultCard({
+    required this.data,
+    required this.onOpenCare,
+  });
+
+  bool _isHealthy(String s) {
+    final x = s.toLowerCase().trim();
+    return x == 'nenhuma' ||
+        x == 'saudável' ||
+        x.contains('sem doença') ||
+        x.contains('healthy') ||
+        x.contains('no disease');
+  }
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
 
-    final disease = data['disease'] ??
-        data['doenca'] ??
-        data['diagnosis'] ??
-        'Resultado indisponível';
+    final planta =
+        (data['planta'] ?? data['plant'] ?? data['species'] ?? '—').toString();
 
-    final causes = (data['cause'] ?? data['causas'] ?? data['causes'] ?? '').toString();
-    final treatment = (data['treatment'] ?? data['tratamento'] ?? '').toString();
-    final tips = (data['tips'] ?? data['dicas'] ?? '').toString();
+    final diseaseRaw = (data['doenca'] ??
+            data['disease'] ??
+            data['diagnosis'] ??
+            data['resultado'] ??
+            'Resultado indisponível')
+        .toString();
 
-    final isAlert = disease.toString().toLowerCase() != 'saudável' &&
-        !disease.toString().toLowerCase().contains('healthy');
+    final causes = (data['causaProvavel'] ??
+            data['causas'] ??
+            data['cause'] ??
+            data['causes'] ??
+            '')
+        .toString();
 
-    return Card(
-      elevation: 6,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
-      color: isAlert
-          ? (Theme.of(context).brightness == Brightness.dark
-              ? const Color(0xFF2A0F0E)
-              : const Color(0xFFFFEDEA))
-          : (Theme.of(context).brightness == Brightness.dark
-              ? const Color(0xFF0E2A14)
-              : const Color(0xFFEAFBEA)),
-      child: Padding(
-        padding: const EdgeInsets.all(16.0),
-        child: DefaultTextStyle.merge(
-          style: theme.textTheme.bodyMedium!,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Text(
-                isAlert ? '⚠️ Possível doença detectada' : '✅ Sem sinais aparentes',
-                style: theme.textTheme.titleMedium!.copyWith(fontWeight: FontWeight.w700),
-              ),
-              const SizedBox(height: 8),
-              Text.rich(
-                TextSpan(
+    final treatment =
+        (data['tratamento'] ?? data['treatment'] ?? '').toString();
+
+    final tips = (data['dicas'] ?? data['tips'] ?? '').toString();
+
+    final healthy = _isHealthy(diseaseRaw);
+
+    final gradient = healthy
+        ? const LinearGradient(
+            colors: [Color(0xFFE8F5E9), Color(0xFFA5D6A7)],
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+          )
+        : const LinearGradient(
+            colors: [Color(0xFFFFEBEE), Color(0xFFFFCDD2)],
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+          );
+
+    final icon = healthy ? Icons.eco_rounded : Icons.warning_amber_rounded;
+    final iconColor = healthy ? Colors.green : Colors.redAccent;
+    final title = healthy
+        ? '🌿 Sua planta está saudável!'
+        : '⚠️ Possível doença detectada';
+    final subtitle = healthy
+        ? 'Nenhum sinal de pragas ou infecções foi encontrado.'
+        : 'Veja detalhes abaixo.';
+
+    final maxCardHeight = MediaQuery.of(context).size.height * 0.80;
+
+    return ConstrainedBox(
+      constraints: BoxConstraints(maxHeight: maxCardHeight),
+      child: Container(
+        decoration: BoxDecoration(
+          gradient: gradient,
+          borderRadius: BorderRadius.circular(20),
+          boxShadow: const [
+            BoxShadow(color: Colors.black26, blurRadius: 8, offset: Offset(0, 4))
+          ],
+        ),
+        child: Material(
+          type: MaterialType.transparency,
+          borderRadius: BorderRadius.circular(20),
+          child: InkWell(
+            borderRadius: BorderRadius.circular(20),
+            onTap: onOpenCare,
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(20),
+              child: DefaultTextStyle.merge(
+                style: theme.textTheme.bodyMedium!,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.center,
                   children: [
-                    const TextSpan(
-                      text: 'Doença: ',
-                      style: TextStyle(fontWeight: FontWeight.w700),
+                    Icon(icon, size: 72, color: iconColor),
+                    const SizedBox(height: 10),
+                    Text(
+                      title,
+                      style: theme.textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w800,
+                        color: iconColor,
+                      ),
+                      textAlign: TextAlign.center,
                     ),
-                    TextSpan(text: disease.toString()),
+                    const SizedBox(height: 6),
+                    Text(
+                      subtitle,
+                      style: theme.textTheme.bodyMedium?.copyWith(
+                        color: Colors.black87,
+                      ),
+                      textAlign: TextAlign.center,
+                    ),
+                    const SizedBox(height: 12),
+                    const Divider(height: 24, thickness: 1),
+                    _infoRow('👤 Planta', planta),
+                    _infoRow('🦠 Doença', healthy ? 'Nenhuma' : diseaseRaw),
+                    if (causes.trim().isNotEmpty)
+                      _infoRow('📋 Causa provável', causes),
+                    if (!healthy && treatment.trim().isNotEmpty)
+                      _infoRow('💊 Tratamento', treatment),
+                    if (tips.trim().isNotEmpty) _infoRow('💡 Dicas', tips),
+                    const SizedBox(height: 12),
+                    OutlinedButton.icon(
+                      onPressed: onOpenCare,
+                      icon: const Icon(Icons.menu_open_rounded),
+                      label: const Text('Ver cuidados detalhados'),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: iconColor,
+                        side: BorderSide(color: iconColor),
+                      ),
+                    ),
                   ],
                 ),
               ),
-              if (causes.isNotEmpty) ...[
-                const SizedBox(height: 6),
-                Text.rich(
-                  TextSpan(
-                    children: [
-                      const TextSpan(
-                        text: 'Causas: ',
-                        style: TextStyle(fontWeight: FontWeight.w700),
-                      ),
-                      TextSpan(text: causes),
-                    ],
-                  ),
-                ),
-              ],
-              if (treatment.isNotEmpty) ...[
-                const SizedBox(height: 6),
-                Text.rich(
-                  TextSpan(
-                    children: [
-                      const TextSpan(
-                        text: 'Tratamento: ',
-                        style: TextStyle(fontWeight: FontWeight.w700),
-                      ),
-                      TextSpan(text: treatment),
-                    ],
-                  ),
-                ),
-              ],
-              if (tips.isNotEmpty) ...[
-                const SizedBox(height: 6),
-                Text.rich(
-                  TextSpan(
-                    children: [
-                      const TextSpan(
-                        text: 'Dicas: ',
-                        style: TextStyle(fontWeight: FontWeight.w700),
-                      ),
-                      TextSpan(text: tips),
-                    ],
-                  ),
-                ),
-              ],
-            ],
+            ),
           ),
         ),
+      ),
+    );
+  }
+
+  Widget _infoRow(String title, String value) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            '$title: ',
+            style: const TextStyle(fontWeight: FontWeight.w700),
+          ),
+          Expanded(child: Text(value)),
+        ],
       ),
     );
   }
