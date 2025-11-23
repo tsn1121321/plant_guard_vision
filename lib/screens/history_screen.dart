@@ -21,11 +21,24 @@ class _HistoryScreenState extends State<HistoryScreen> {
   }
 
   Future<void> _loadHistory() async {
-    final prefs = await SharedPreferences.getInstance();
-    final raw = prefs.getString('history') ?? '[]';
-    final list = (jsonDecode(raw) as List).cast<Map<String, dynamic>>();
-    setState(() => _items = list);
+  final prefs = await SharedPreferences.getInstance();
+  final raw = prefs.getString('history') ?? '[]';
+
+  try {
+    final decoded = jsonDecode(raw);
+    if (decoded is List) {
+      final list = decoded.map<Map<String, dynamic>>((e) {
+        return Map<String, dynamic>.from(e as Map);
+      }).toList();
+      setState(() => _items = list);
+    } else {
+      setState(() => _items = []);
+    }
+  } catch (_) {
+    setState(() => _items = []);
   }
+}
+
 
   Future<void> _clearHistory() async {
     final prefs = await SharedPreferences.getInstance();
